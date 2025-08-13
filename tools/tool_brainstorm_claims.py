@@ -96,7 +96,7 @@ def generate_claims(topic, side, area):
             model="gpt-4o",
             messages=[{"role": "user", "content": prompt}],
             temperature=0
-            max_completion_tokens=1500,
+            max_tokens=1500,
         )
     except Exception as e:
         st.error(f"OpenAI API call failed: {e}")
