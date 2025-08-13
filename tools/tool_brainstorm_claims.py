@@ -93,8 +93,9 @@ def generate_claims(topic, side, area):
 
     try:
         response = openai.chat.completions.create(
-            model="gpt-5",
+            model="gpt-4o",
             messages=[{"role": "user", "content": prompt}],
+            temperature=0
             max_completion_tokens=1500,
         )
     except Exception as e:
