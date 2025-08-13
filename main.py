@@ -1,3 +1,4 @@
+# main.py
 import streamlit as st
 from auth import init_db, authenticate
 

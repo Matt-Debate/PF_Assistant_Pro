@@ -1,0 +1,8 @@
+bcrypt
+streamlit
+openai
+requests
+httpx
+python-docx
+pandas
+plotly
