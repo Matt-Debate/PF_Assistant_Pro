@@ -18,13 +18,6 @@ def main():
     if "content" not in st.session_state:
         st.session_state.content = {}
 
-    st.markdown(
-        """
-        Welcome to the AI Argument Writer. You’ll go step by step through the process of producing a complete argument.
-        Provide a topic, side, and an argument type — the app will generate claims, fetch evidence, and draft a contention.
-        """
-    )
-
     # -----------------------
     # Step 1: Input Topic, Side, Area
     # -----------------------
@@ -195,7 +188,6 @@ def main():
     # Steps 6-8: leave mostly unchanged but use st.rerun
     # -----------------------
     elif st.session_state.step == 6:
-        st.subheader("Step 6: Revise Contention")
 
         raw_contention = st.session_state.content.get("raw_contention", "")
         merged_evidence_json_str = st.session_state.content.get("merged_evidence_json_str", "")
@@ -211,7 +203,7 @@ def main():
                 st.error(f"Error revising contention: {e}")
                 return
 
-            st.text_area("Polished Contention", polished_contention, height=300)
+            st.text_area("Polished Contention", polished_contention, height=600)
             # Store both keys so final output can use either
             st.session_state.content["contention_text"] = polished_contention
             st.session_state.content["polished_contention"] = polished_contention
