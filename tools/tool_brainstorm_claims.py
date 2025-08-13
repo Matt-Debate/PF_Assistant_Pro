@@ -2,7 +2,16 @@ import json
 import streamlit as st
 import openai
 
-openai.api_key = st.secrets["OPENAI_API_KEY"]
+def get_openai_client():
+    """
+    Lazily loads OpenAI client with API key from Streamlit secrets.
+    """
+    api_key = st.secrets.get("OPENAI_API_KEY")
+    if not api_key:
+        st.error("Missing OPENAI_API_KEY in Streamlit secrets.")
+        return None
+    openai.api_key = api_key
+    return openai
 
 def build_prompt(topic, side, area):
     """
@@ -79,23 +88,24 @@ def clean_json_output(raw_output):
         end = raw_output.rindex("}") + 1
         return raw_output[start:end].strip()
     except ValueError:
-        # If braces not found, return raw output stripped
         return raw_output.strip()
 
 def generate_claims(topic, side, area):
     """
     Generate contention claims by calling OpenAI's chat completion API.
     Returns the parsed JSON object or None on failure.
-    Displays intermediate outputs using Streamlit.
     """
+    openai_client = get_openai_client()
+    if not openai_client:
+        return None
 
     prompt = build_prompt(topic, side, area)
 
     try:
-        response = openai.chat.completions.create(
+        response = openai_client.chat.completions.create(
             model="gpt-4o",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0
+            temperature=0,
             max_tokens=1500,
         )
     except Exception as e:
@@ -103,15 +113,10 @@ def generate_claims(topic, side, area):
         return None
 
     raw_claim_json_str = response.choices[0].message.content.strip()
-
-   
-
     cleaned_claim_json_str = clean_json_output(raw_claim_json_str)
 
-    
     try:
-        claims_data = json.loads(cleaned_claim_json_str)
-        return claims_data
+        return json.loads(cleaned_claim_json_str)
     except json.JSONDecodeError as e:
         st.error(f"Failed to parse brainstorm claims JSON after formatting: {e}")
         return None
