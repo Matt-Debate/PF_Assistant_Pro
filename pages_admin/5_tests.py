@@ -496,7 +496,137 @@ if st.session_state.get("evm_plan_approved"):
             file_name=f"batch_{len(st.session_state.evm_batches)}.json",
             mime="application/json",
         )
+        # Under: if st.session_state.evm_batches:
+last_batch = st.session_state.evm_batches[-1]
+last_idx = len(st.session_state.evm_batches)
+current_n = st.session_state.get("evm_current_batch", 1)
+total_cards = int(st.session_state.evm_intake.get("total_cards", 240))
+batch_size = int(st.session_state.evm_intake.get("batch_size", 20))
+total_batches = max(1, (total_cards + batch_size - 1) // batch_size)
 
+c_next1, c_next2 = st.columns(2)
+with c_next1:
+    if current_n <= total_batches and st.button(f"✅ Accept Batch {last_idx} & Generate Batch {current_n}"):
+        try:
+            # Build seen list
+            seen_list = []
+            for b in st.session_state.evm_batches:
+                for c in b:
+                    k = _seen_key(c)
+                    if not k:
+                        continue
+                    url, quote = k.split("||", 1)
+                    seen_list.append((url, quote))
+
+            with st.spinner(f"Generating batch {current_n}..."):
+                next_cards = _generate_batch(
+                    st.session_state.evm_intake,
+                    st.session_state.evm_plan_text,
+                    current_n,
+                    st.session_state.evm_model,
+                    seen_list,
+                )
+
+            # De-dup vs global seen set
+            new_batch = []
+            dups = 0
+            for c in next_cards:
+                key = _seen_key(c)
+                if not key:
+                    continue
+                if key in st.session_state.evm_seen_set:
+                    dups += 1
+                    continue
+                st.session_state.evm_seen_set.add(key)
+                new_batch.append(c)
+
+            if dups > 0:
+                st.warning(f"Removed {dups} duplicate card(s) that repeated a prior (url, quote).")
+
+            st.session_state.evm_batches.append(new_batch)
+            st.session_state.evm_current_batch = current_n + 1
+            st.success(f"Batch {current_n} generated with {len(new_batch)} cards.")
+        except Exception as e:
+            st.error(f"Batch generation failed: {e}")
+
+with c_next2:
+    if st.button("🔁 Regenerate This Batch Instead"):
+        # Remove last batch and decrement current_n so you can rerun it
+        if st.session_state.evm_batches:
+            removed = st.session_state.evm_batches.pop()
+            # Also clean their seen keys
+            for c in removed:
+                k = _seen_key(c)
+                if k and k in st.session_state.evm_seen_set:
+                    st.session_state.evm_seen_set.remove(k)
+            st.session_state.evm_current_batch = max(1, current_n - 1)
+            st.info("Last batch removed. Click Generate to redo it.")
+            
+# Under: if st.session_state.evm_batches:
+last_batch = st.session_state.evm_batches[-1]
+last_idx = len(st.session_state.evm_batches)
+current_n = st.session_state.get("evm_current_batch", 1)
+total_cards = int(st.session_state.evm_intake.get("total_cards", 240))
+batch_size = int(st.session_state.evm_intake.get("batch_size", 20))
+total_batches = max(1, (total_cards + batch_size - 1) // batch_size)
+
+c_next1, c_next2 = st.columns(2)
+with c_next1:
+    if current_n <= total_batches and st.button(f"✅ Accept Batch {last_idx} & Generate Batch {current_n}"):
+        try:
+            # Build seen list
+            seen_list = []
+            for b in st.session_state.evm_batches:
+                for c in b:
+                    k = _seen_key(c)
+                    if not k:
+                        continue
+                    url, quote = k.split("||", 1)
+                    seen_list.append((url, quote))
+
+            with st.spinner(f"Generating batch {current_n}..."):
+                next_cards = _generate_batch(
+                    st.session_state.evm_intake,
+                    st.session_state.evm_plan_text,
+                    current_n,
+                    st.session_state.evm_model,
+                    seen_list,
+                )
+
+            # De-dup vs global seen set
+            new_batch = []
+            dups = 0
+            for c in next_cards:
+                key = _seen_key(c)
+                if not key:
+                    continue
+                if key in st.session_state.evm_seen_set:
+                    dups += 1
+                    continue
+                st.session_state.evm_seen_set.add(key)
+                new_batch.append(c)
+
+            if dups > 0:
+                st.warning(f"Removed {dups} duplicate card(s) that repeated a prior (url, quote).")
+
+            st.session_state.evm_batches.append(new_batch)
+            st.session_state.evm_current_batch = current_n + 1
+            st.success(f"Batch {current_n} generated with {len(new_batch)} cards.")
+        except Exception as e:
+            st.error(f"Batch generation failed: {e}")
+
+with c_next2:
+    if st.button("🔁 Regenerate This Batch Instead"):
+        # Remove last batch and decrement current_n so you can rerun it
+        if st.session_state.evm_batches:
+            removed = st.session_state.evm_batches.pop()
+            # Also clean their seen keys
+            for c in removed:
+                k = _seen_key(c)
+                if k and k in st.session_state.evm_seen_set:
+                    st.session_state.evm_seen_set.remove(k)
+            st.session_state.evm_current_batch = max(1, current_n - 1)
+            st.info("Last batch removed. Click Generate to redo it.")
         st.markdown("#### Fix a Card in Last Batch")
         fix_idx = st.number_input("Card # to replace (1-based)", min_value=1, max_value=max(1, len(last_batch)), value=1)
         if st.button("Fix #N in Last Batch"):
