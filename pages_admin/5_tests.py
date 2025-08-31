@@ -1,4 +1,7 @@
 import json
+import random
+import time
+import re
 import streamlit as st
 import pandas as pd
 from typing import List, Dict, Any, Tuple
@@ -29,6 +32,26 @@ def _get_oai() -> OpenAI:
     if not api_key:
         raise RuntimeError("Missing OPENAI_API_KEY in Streamlit secrets.")
     return OpenAI(api_key=api_key)
+
+
+def _with_retries(make_call, *, retries: int = 3, base_delay: float = 1.0, max_delay: float = 8.0):
+    """
+    Exponential backoff around OpenAI calls.
+    Pass a zero-arg lambda: _with_retries(lambda: client.chat.completions.create(...))
+    """
+    last_err = None
+    for attempt in range(retries):
+        try:
+            return make_call()
+        except Exception as e:
+            last_err = e
+            if attempt >= retries - 1:
+                raise
+            # jittered exponential backoff
+            sleep_s = min(max_delay, base_delay * (2 ** attempt)) + random.uniform(0, 0.25)
+            time.sleep(sleep_s)
+    if last_err:
+        raise last_err
 
 
 def _get_output_text(resp) -> str:
@@ -141,14 +164,14 @@ Use the taxonomy: Definitions & frameworks; Economy/exports/productivity; Border
 Output: A concise, numbered plan in prose. Do not produce any cards yet.
 """
 
-    resp = client.responses.create(
+    resp = _with_retries(lambda: client.responses.create(
         model=model,
         input=[
             {"role": "system", "content": sys},
             {"role": "user", "content": user}
         ],
         reasoning={"effort": "high"},
-    )
+    ))
     return _get_output_text(resp).strip()
 
 
@@ -196,6 +219,7 @@ QUALITY RULES
 - Quant hygiene: prefer stats with denominators/baselines and clear timeframes.
 - Con rebuttal seeds: for Con cards, favor quotes that frame trade-offs (fiscal costs, regional disparities, environmental externalities, governance capacity).
 - Quotes must be verbatim multi-sentence paragraphs from one location on the page (no stitching far-apart parts).
+- Quotes must be in English.
 - Prefer authoritative, recent, accessible sources; avoid broken links or paywalled abstracts without visible text. If text is not present at the URL, replace the card before delivering the batch.
 - Diversity: vary publishers/countries/years/functions; avoid over-reliance on any single institution.
 """
@@ -296,7 +320,7 @@ Use this seen set of (url, exact quote) already used in prior batches; do not re
     card_schema = _card_schema()
     wrapped_schema = _cards_envelope_schema(card_schema, min_items=1)
 
-    resp = client.chat.completions.create(
+    resp = _with_retries(lambda: client.chat.completions.create(
         model=model,
         messages=[
             {"role": "system", "content": "You cut debate evidence cards with meticulous sourcing and formatting."},
@@ -310,7 +334,7 @@ Use this seen set of (url, exact quote) already used in prior batches; do not re
                 "strict": True,
             },
         },
-    )
+    ))
 
     obj = _get_parsed_json(resp)
     if obj is None:
@@ -325,9 +349,77 @@ Use this seen set of (url, exact quote) already used in prior batches; do not re
     return cards
 
 
+# ---------- Excel underline helpers (xlsxwriter) ----------
+
+def _find_all_occurrences(text: str, phrase: str) -> List[Tuple[int, int]]:
+    """
+    Case-insensitive find of all (start, end) for `phrase` within `text`.
+    """
+    hits = []
+    if not phrase:
+        return hits
+    t_low = text.lower()
+    p_low = phrase.lower()
+    start = 0
+    while True:
+        idx = t_low.find(p_low, start)
+        if idx == -1:
+            break
+        hits.append((idx, idx + len(phrase)))
+        start = idx + len(phrase)
+    return hits
+
+
+def _merge_overlaps(ranges: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    """
+    Merge overlapping/contiguous ranges, preferring earlier ranges (stable).
+    """
+    if not ranges:
+        return []
+    ranges = sorted(ranges, key=lambda x: (x[0], x[1]))
+    merged = []
+    cur_s, cur_e = ranges[0]
+    for s, e in ranges[1:]:
+        if s <= cur_e:  # overlap or touching
+            cur_e = max(cur_e, e)
+        else:
+            merged.append((cur_s, cur_e))
+            cur_s, cur_e = s, e
+    merged.append((cur_s, cur_e))
+    return merged
+
+
+def _rich_parts_for_quote(quote: str, phrases: List[str], underline_format) -> List[Any] | None:
+    """
+    Build args for worksheet.write_rich_string(...):
+    [ 'pre', underline_format, 'hit', 'mid', underline_format, 'hit2', 'post' ]
+    Returns None if no matches found.
+    """
+    all_ranges: List[Tuple[int, int]] = []
+    for ph in phrases or []:
+        all_ranges.extend(_find_all_occurrences(quote, ph))
+
+    if not all_ranges:
+        return None
+
+    merged = _merge_overlaps(all_ranges)
+    parts: List[Any] = []
+    pos = 0
+    for s, e in merged:
+        if s > pos:
+            parts.append(quote[pos:s])  # plain
+        parts.extend([underline_format, quote[s:e]])  # underlined run
+        pos = e
+    if pos < len(quote):
+        parts.append(quote[pos:])
+    return parts
+
+
 def _merge_to_excel(all_cards: List[Dict[str, Any]]) -> BytesIO | None:
-    # Build DataFrames
+    # Build DataFrames + keep phrases parallel for formatting
     rows_cards = []
+    phrases_list: List[List[str]] = []
+
     for c in all_cards:
         cit = c.get("citation", {}) or {}
         rows_cards.append(
@@ -345,6 +437,7 @@ def _merge_to_excel(all_cards: List[Dict[str, Any]]) -> BytesIO | None:
                 "Flow Sentence": c.get("flow_sentence", ""),
             }
         )
+        phrases_list.append(list(c.get("underline_phrases", []) or []))
 
     df_cards = pd.DataFrame(rows_cards)
     df_index = pd.DataFrame([
@@ -362,19 +455,44 @@ def _merge_to_excel(all_cards: List[Dict[str, Any]]) -> BytesIO | None:
     ])
 
     bio = BytesIO()
-    last_err = None
 
-    # Try available engines: let pandas choose (None), then openpyxl, then xlsxwriter
-    for eng in (None, "openpyxl", "xlsxwriter"):
+    # Prefer xlsxwriter (supports rich text), then openpyxl, then default
+    for eng in ("xlsxwriter", None):
         try:
             bio.seek(0); bio.truncate(0)
             with pd.ExcelWriter(bio, engine=eng) as writer:
                 df_cards.to_excel(writer, sheet_name="Cards", index=False)
                 df_index.to_excel(writer, sheet_name="Quick Index", index=False)
+
+                # If we have xlsxwriter, rewrite the Quote column as rich text with underlines
+                if eng == "xlsxwriter":
+                    workbook  = writer.book
+                    worksheet = writer.sheets["Cards"]
+                    underline_fmt = workbook.add_format({"underline": True})
+                    # Column index of 'Quote'
+                    try:
+                        qcol = df_cards.columns.get_loc("Quote")
+                    except Exception:
+                        qcol = None
+
+                    if qcol is not None:
+                        # Rewrite each row's quote with rich text parts
+                        for i, row in enumerate(rows_cards):
+                            quote = row.get("Quote", "")
+                            phrases = phrases_list[i]
+                            parts = _rich_parts_for_quote(quote, phrases, underline_fmt)
+                            # Excel row index: +1 due to header row
+                            excel_row = i + 1
+                            if parts and len(parts) >= 2:
+                                worksheet.write_rich_string(excel_row, qcol, *parts)
+                            else:
+                                # No matches -> ensure the plain text is written
+                                worksheet.write(excel_row, qcol, quote)
+
             bio.seek(0)
             return bio
-        except Exception as e:
-            last_err = e
+        except Exception:
+            # try next engine
             continue
 
     # If we get here, no Excel engines were available
@@ -611,7 +729,7 @@ Return JSON with exactly ONE card in the wrapped form {{ "cards": [ ... ] }}. Do
                 card_schema = _card_schema()
                 wrapped_schema = _cards_envelope_schema(card_schema, min_items=1, max_items=1)
 
-                resp = client.chat.completions.create(
+                resp = _with_retries(lambda: client.chat.completions.create(
                     model=st.session_state.evm_model,
                     messages=[
                         {"role": "system", "content": "You cut debate evidence cards with meticulous sourcing and formatting."},
@@ -625,7 +743,7 @@ Return JSON with exactly ONE card in the wrapped form {{ "cards": [ ... ] }}. Do
                             "strict": True,
                         },
                     },
-                )
+                ))
 
                 obj = _get_parsed_json(resp)
                 if obj is None:
