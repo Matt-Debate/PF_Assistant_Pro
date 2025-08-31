@@ -257,7 +257,6 @@ Use this seen set of (url, exact quote) already used in prior batches; do not re
             {"role": "system", "content": "You cut debate evidence cards with meticulous sourcing and formatting."},
             {"role": "user", "content": user},
         ],
-        temperature=0,
         response_format={
             "type": "json_schema",
             "json_schema": {
@@ -535,7 +534,6 @@ Return a JSON array with exactly ONE card following the schema below. Do not inc
                         {"role": "system", "content": "You cut debate evidence cards with meticulous sourcing and formatting."},
                         {"role": "user", "content": user},
                     ],
-                    temperature=0,
                     response_format={
                         "type": "json_schema",
                         "json_schema": {
