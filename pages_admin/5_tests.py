@@ -1,43 +1,48 @@
+import os
 import json
+import uuid
 import random
 import time
 import streamlit as st
 import pandas as pd
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from io import BytesIO
 
 from auth import get_username, log_query, get_remaining_queries
 from openai import OpenAI
 
-# --- Constants ---
+# ---------------------------
+# Constants / Paths
+# ---------------------------
 TOOL_NAME = "evidence_machine"
-DEFAULT_MODEL = "gpt-5"  # Planning call uses Responses API without response_format
+DEFAULT_MODEL = "gpt-5"
+RUNS_DIR = "evm_runs"  # persisted checkpoints live here (create if missing)
+os.makedirs(RUNS_DIR, exist_ok=True)
 
-
-# --- State helpers ---
+# ---------------------------
+# Session init
+# ---------------------------
 def _init_state():
     ss = st.session_state
-    ss.setdefault("evm_intake", {})
-    ss.setdefault("evm_plan_text", None)
-    ss.setdefault("evm_batches", [])          # list[list[card]]
-    ss.setdefault("evm_seen_set", set())      # set of "url||quote"
-    ss.setdefault("evm_model", DEFAULT_MODEL)
-    ss.setdefault("evm_total_generated", 0)   # cumulative cards generated
+    ss.setdefault("evm_run_id", None)            # active run id
+    ss.setdefault("evm_run", None)               # active run dict
+    ss.setdefault("evm_model", DEFAULT_MODEL)    # model
+    ss.setdefault("evm_logs", [])                # UI logs (derived from run)
 
-
-# --- OpenAI helpers ---
+# ---------------------------
+# OpenAI client (singleton)
+# ---------------------------
+@st.cache_resource(show_spinner=False)
 def _get_oai() -> OpenAI:
     api_key = st.secrets.get("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("Missing OPENAI_API_KEY in Streamlit secrets.")
     return OpenAI(api_key=api_key)
 
-
-def _with_retries(make_call, *, retries: int = 3, base_delay: float = 1.0, max_delay: float = 8.0):
-    """
-    Exponential backoff around OpenAI calls.
-    Use: _with_retries(lambda: client.chat.completions.create(...))
-    """
+# ---------------------------
+# Retry wrapper
+# ---------------------------
+def _with_retries(make_call, *, retries: int = 4, base_delay: float = 1.0, max_delay: float = 8.0):
     last_err = None
     for attempt in range(retries):
         try:
@@ -51,16 +56,43 @@ def _with_retries(make_call, *, retries: int = 3, base_delay: float = 1.0, max_d
     if last_err:
         raise last_err
 
+# ---------------------------
+# Persistence
+# ---------------------------
+def _run_path(username: str, run_id: str) -> str:
+    return os.path.join(RUNS_DIR, f"{username}_{run_id}.json")
 
+def _save_run(username: str, run: Dict[str, Any]) -> None:
+    path = _run_path(username, run["run_id"])
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(run, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)  # atomic
+
+def _load_run(username: str, run_id: str) -> Optional[Dict[str, Any]]:
+    path = _run_path(username, run_id)
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def _list_runs_for_user(username: str) -> List[str]:
+    prefix = f"{username}_"
+    ids = []
+    for name in sorted(os.listdir(RUNS_DIR), reverse=True):
+        if name.startswith(prefix) and name.endswith(".json"):
+            rid = name[len(prefix):-5]
+            ids.append(rid)
+    return ids
+
+# ---------------------------
+# Model helpers (extraction)
+# ---------------------------
 def _get_output_text(resp) -> str:
-    """
-    Best-effort extraction for Responses API objects and Chat Completions objects.
-    """
     if hasattr(resp, "output_text"):
         text = getattr(resp, "output_text")
         if isinstance(text, str) and text.strip():
             return text
-
     try:
         choices = getattr(resp, "choices", None)
         if choices and len(choices) > 0:
@@ -77,17 +109,12 @@ def _get_output_text(resp) -> str:
                     return content
     except Exception:
         pass
-
     try:
         return str(resp)
     except Exception:
         return ""
 
-
 def _get_parsed_json(resp) -> Any:
-    """
-    Prefer SDK's validated parsed object; otherwise JSON-load the content.
-    """
     try:
         choices = getattr(resp, "choices", None)
         if choices and len(choices) > 0:
@@ -107,8 +134,9 @@ def _get_parsed_json(resp) -> Any:
     except Exception:
         return None
 
-
-# --- App logic helpers ---
+# ---------------------------
+# Evidence logic
+# ---------------------------
 def _seen_key(card: Dict[str, Any]) -> str:
     try:
         url = (card.get("citation") or {}).get("url", "").strip()
@@ -117,67 +145,11 @@ def _seen_key(card: Dict[str, Any]) -> str:
     except Exception:
         return ""
 
-
-def _propose_plan(intake: Dict[str, Any], model: str) -> str:
-    """
-    Ask the model to propose the batch plan. The model chooses the number and typical size of batches
-    based on the topic and the total card target.
-    """
-    client = _get_oai()
-
-    resolution = intake.get("resolution", "").strip()
-    area = intake.get("area", "").strip()
-    sides = ", ".join(intake.get("sides", ["Pro", "Con"]))
-    total_cards = int(intake.get("total_cards", 100))
-
-    sys = "You are a debate coach planning an evidence pack across batches."
-
-    user = f"""
-OBJECTIVE
-Build an evidence pack of about {total_cards} total cards.
-
-RESOLUTION: {resolution}
-AREA: {area or '(none)'}
-SIDES: {sides}
-
-Task: Propose a numbered batch plan where YOU choose both:
-- the number of batches, and
-- the typical cards per batch,
-based on the topic’s complexity and the {total_cards}-card target. Make the plan realistic: more complex scopes can use more batches or larger batches. The plan should sum to roughly {total_cards} cards overall (±10%).
-
-For each batch, include:
-- Side(s) (Pro or Con; balance across plan)
-- Thematic focus (functions/angles you’ll target)
-- A cards-per-batch target (your choice; can vary by batch)
-- Coverage goals (countries/subregions, sectors, mechanisms) to keep the full set broad and non-duplicative
-- Note an approximate share of quantitative cards so overall we exceed 30–40% quant
-
-Use the taxonomy: Definitions & frameworks; Economy/exports/productivity; Border/customs/single window/authorized operator;
-Domestic transport (roads/rail/waterways); Maritime connectivity/ports/shipping; Energy corridors/interconnection;
-Agriculture/cold chain/food loss; SME inclusion/competitiveness; Digital trade/logistics; Climate resilience & disruptions;
-Finance/PPP; Legal/regulatory/integration blocs; Subregional case studies; and for Con: fiscal trade-offs, distributional/inequality
-effects, environment/externalities, dependency/lock-in, governance capacity risks.
-
-Output: A concise, numbered plan in prose. Do not produce any cards yet.
-"""
-
-    resp = _with_retries(lambda: client.responses.create(
-        model=model,
-        input=[
-            {"role": "system", "content": sys},
-            {"role": "user", "content": user}
-        ],
-        reasoning={"effort": "high"},
-    ))
-    return _get_output_text(resp).strip()
-
-
 def _batch_prompt_header(intake: Dict[str, Any]) -> str:
     resolution = intake.get("resolution", "").strip()
     area = intake.get("area", "").strip()
     sides = ", ".join(intake.get("sides", ["Pro", "Con"]))
     return f"RESOLUTION: {resolution}\nAREA: {area or '(none)'}\nSIDES: {sides}"
-
 
 def _schema_block() -> str:
     return (
@@ -206,7 +178,6 @@ STRICT CARD SCHEMA (Return JSON ONLY; wrapped as {"cards":[...]} )
 """
     ).strip()
 
-
 def _quality_rules_block() -> str:
     return (
         """
@@ -220,19 +191,6 @@ QUALITY RULES
 - Diversity: vary publishers/countries/years/functions; avoid over-reliance on any single institution.
 """
     ).strip()
-
-
-def _cards_envelope_schema(item_schema: Dict[str, Any], min_items: int = 1, max_items: int | None = None) -> Dict[str, Any]:
-    arr_schema: Dict[str, Any] = {"type": "array", "items": item_schema, "minItems": min_items}
-    if max_items is not None:
-        arr_schema["maxItems"] = max_items
-    return {
-        "type": "object",
-        "properties": {"cards": arr_schema},
-        "required": ["cards"],
-        "additionalProperties": False,
-    }
-
 
 def _card_schema() -> Dict[str, Any]:
     return {
@@ -262,18 +220,59 @@ def _card_schema() -> Dict[str, Any]:
         "additionalProperties": False,
     }
 
+def _cards_envelope_schema(item_schema: Dict[str, Any], min_items: int = 1, max_items: Optional[int] = None) -> Dict[str, Any]:
+    arr_schema: Dict[str, Any] = {"type": "array", "items": item_schema, "minItems": min_items}
+    if max_items is not None:
+        arr_schema["maxItems"] = max_items
+    return {"type": "object", "properties": {"cards": arr_schema}, "required": ["cards"], "additionalProperties": False}
 
-def _generate_batch(
-    intake: Dict[str, Any], plan_text: str, batch_num: int, model: str, seen_pairs: List[Tuple[str, str]]
-) -> List[Dict[str, Any]]:
-    """
-    Generate ONE batch. Return the list of card objects.
-    """
+def _propose_plan(intake: Dict[str, Any], model: str) -> str:
     client = _get_oai()
+    resolution = intake.get("resolution", "").strip()
+    area = intake.get("area", "").strip()
+    sides = ", ".join(intake.get("sides", ["Pro", "Con"]))
+    total_cards = int(intake.get("total_cards", 100))
+
+    sys = "You are a debate coach planning an evidence pack across batches."
+    user = f"""
+OBJECTIVE
+Build an evidence pack of about {total_cards} total cards.
+
+RESOLUTION: {resolution}
+AREA: {area or '(none)'}
+SIDES: {sides}
+
+Task: Propose a numbered batch plan where YOU choose both:
+- the number of batches, and
+- the typical cards per batch,
+based on the topic’s complexity and the {total_cards}-card target. The plan should total ≈{total_cards} cards overall (±10%).
+
+For each batch, include:
+- Side(s) (Pro or Con; balance across plan)
+- Thematic focus (functions/angles you’ll target)
+- Cards-per-batch target (your choice; can vary by batch)
+- Coverage goals to keep the full set broad and non-duplicative
+- Approximate share of quantitative cards so overall we exceed 30–40% quant
+
+Use the taxonomy: Definitions & frameworks; Economy/exports/productivity; Border/customs/single window/authorized operator;
+Domestic transport (roads/rail/waterways); Maritime connectivity/ports/shipping; Energy corridors/interconnection;
+Agriculture/cold chain/food loss; SME inclusion/competitiveness; Digital trade/logistics; Climate resilience & disruptions;
+Finance/PPP; Legal/regulatory/integration blocs; Subregional case studies; and for Con: fiscal trade-offs, distributional/inequality
+effects, environment/externalities, dependency/lock-in, governance capacity risks.
+
+Output: A concise, numbered plan in prose. Do not produce any cards yet.
+"""
+    resp = _with_retries(lambda: _get_oai().responses.create(
+        model=model,
+        input=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
+        reasoning={"effort": "high"},
+    ))
+    return _get_output_text(resp).strip()
+
+def _generate_batch(intake: Dict[str, Any], plan_text: str, batch_num: int, model: str, seen_pairs: List[Tuple[str, str]]) -> List[Dict[str, Any]]:
     header = _batch_prompt_header(intake)
     schema = _schema_block()
     rules = _quality_rules_block()
-
     seen_text = "\n".join([f"- URL: {u} | QUOTE: {q[:140]}" for (u, q) in seen_pairs]) if seen_pairs else "(none yet)"
 
     user = f"""
@@ -292,11 +291,10 @@ Do not repeat any (url, exact quote) from previous batches:
 
 {schema}
 """
-
     card_schema = _card_schema()
     wrapped_schema = _cards_envelope_schema(card_schema, min_items=1)
 
-    resp = _with_retries(lambda: client.chat.completions.create(
+    resp = _with_retries(lambda: _get_oai().chat.completions.create(
         model=model,
         messages=[
             {"role": "system", "content": "You cut debate evidence cards with meticulous sourcing and formatting."},
@@ -307,7 +305,6 @@ Do not repeat any (url, exact quote) from previous batches:
 
     obj = _get_parsed_json(resp)
     if not obj or not isinstance(obj, dict) or "cards" not in obj or not isinstance(obj["cards"], list):
-        # As a fallback, try to parse raw text to JSON
         raw = _get_output_text(resp).strip()
         obj = json.loads(raw)
 
@@ -316,8 +313,9 @@ Do not repeat any (url, exact quote) from previous batches:
         raise ValueError("Model returned empty or invalid 'cards' array.")
     return cards
 
-
-# ---------- Excel underline helpers (xlsxwriter) ----------
+# ---------------------------
+# Excel underline helpers
+# ---------------------------
 def _find_all_occurrences(text: str, phrase: str) -> List[Tuple[int, int]]:
     hits = []
     if not phrase:
@@ -333,7 +331,6 @@ def _find_all_occurrences(text: str, phrase: str) -> List[Tuple[int, int]]:
         start = idx + len(phrase)
     return hits
 
-
 def _merge_overlaps(ranges: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
     if not ranges:
         return []
@@ -348,7 +345,6 @@ def _merge_overlaps(ranges: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
             cur_s, cur_e = s, e
     merged.append((cur_s, cur_e))
     return merged
-
 
 def _rich_parts_for_quote(quote: str, phrases: List[str], underline_format) -> List[Any] | None:
     all_ranges: List[Tuple[int, int]] = []
@@ -367,7 +363,6 @@ def _rich_parts_for_quote(quote: str, phrases: List[str], underline_format) -> L
     if pos < len(quote):
         parts.append(quote[pos:])
     return parts
-
 
 def _merge_to_excel(all_cards: List[Dict[str, Any]]) -> BytesIO | None:
     rows_cards = []
@@ -409,51 +404,141 @@ def _merge_to_excel(all_cards: List[Dict[str, Any]]) -> BytesIO | None:
     )
 
     bio = BytesIO()
-
-    # Prefer xlsxwriter (rich text), fallback to default (no underline styling)
+    # prefer xlsxwriter for underline formatting
     for eng in ("xlsxwriter", None):
         try:
-            bio.seek(0)
-            bio.truncate(0)
+            bio.seek(0); bio.truncate(0)
             with pd.ExcelWriter(bio, engine=eng) as writer:
                 df_cards.to_excel(writer, sheet_name="Cards", index=False)
                 df_index.to_excel(writer, sheet_name="Quick Index", index=False)
 
                 if eng == "xlsxwriter":
                     workbook = writer.book
-                    worksheet = writer.sheets["Cards"]
+                    ws = writer.sheets["Cards"]
                     underline_fmt = workbook.add_format({"underline": True})
 
+                    qcol = None
                     try:
                         qcol = df_cards.columns.get_loc("Quote")
                     except Exception:
-                        qcol = None
+                        pass
 
                     if qcol is not None:
                         for i, row in enumerate(rows_cards):
                             quote = row.get("Quote", "")
-                            phrases = phrases_list[i]
-                            parts = _rich_parts_for_quote(quote, phrases, underline_fmt)
-                            excel_row = i + 1  # + header
+                            parts = _rich_parts_for_quote(quote, phrases_list[i], underline_fmt)
+                            excel_row = i + 1
                             if parts and len(parts) >= 2:
-                                worksheet.write_rich_string(excel_row, qcol, *parts)
+                                ws.write_rich_string(excel_row, qcol, *parts)
                             else:
-                                worksheet.write(excel_row, qcol, quote)
+                                ws.write(excel_row, qcol, quote)
 
             bio.seek(0)
             return bio
         except Exception:
             continue
-
     return None
 
+# ---------------------------
+# Generation orchestration (resumable)
+# ---------------------------
+def _append_log(run: Dict[str, Any], msg: str):
+    run.setdefault("logs", [])
+    run["logs"].append(msg)
 
-# --- UI ---
+def _rebuild_seen_set(run: Dict[str, Any]) -> set:
+    seen = set()
+    for batch in run.get("batches", []):
+        for c in batch:
+            k = _seen_key(c)
+            if k:
+                seen.add(k)
+    return seen
+
+def _resume_or_start_generation(username: str, run: Dict[str, Any], auto_continue: bool):
+    """
+    Drive generation until target or until one batch (if auto_continue is False).
+    Always saves after each batch so a disconnect won't lose progress.
+    """
+    intake = run["intake"]
+    model = run["model"]
+    plan_text = run.get("plan_text") or ""
+    target_total = int(intake["total_cards"])
+
+    # ensure seen_set based on saved batches
+    run["seen_set"] = list(_rebuild_seen_set(run))
+
+    # If no plan yet, create one
+    if not plan_text:
+        _append_log(run, "Drafting batch plan…")
+        plan_text = _propose_plan(intake, model)
+        run["plan_text"] = plan_text
+        _append_log(run, "Batch plan ready.")
+        _save_run(username, run)
+
+    # Generate batches
+    MAX_BATCHES = 80
+    while run["total_generated"] < target_total and len(run["batches"]) < MAX_BATCHES:
+        batch_num = len(run["batches"]) + 1
+        _append_log(run, f"Generating batch {batch_num}…")
+
+        # Build seen_pairs from seen_set
+        seen_pairs: List[Tuple[str, str]] = []
+        for sk in run["seen_set"]:
+            try:
+                u, q = sk.split("||", 1)
+                seen_pairs.append((u, q))
+            except Exception:
+                continue
+
+        cards = _generate_batch(intake, run["plan_text"], batch_num, model, seen_pairs)
+
+        # de-dupe vs global seen_set
+        new_batch = []
+        dups = 0
+        for c in cards:
+            k = _seen_key(c)
+            if k and k not in run["seen_set"]:
+                run["seen_set"].append(k)
+                new_batch.append(c)
+            else:
+                dups += 1
+
+        run["batches"].append(new_batch)
+        run["total_generated"] += len(new_batch)
+
+        _append_log(run, f"Batch {batch_num} complete ({len(new_batch)} cards; total {run['total_generated']}/{target_total}).")
+        _save_run(username, run)
+
+        if not auto_continue:
+            break  # stop after one batch if user chose manual stepping
+
+# ---------------------------
+# UI
+# ---------------------------
 st.title("📚 Evidence Packet Machine")
 _init_state()
 
 username = get_username()
 remaining = get_remaining_queries(username, tool=TOOL_NAME) or 0
+st.caption(f"Remaining today for {TOOL_NAME}: {remaining}")
+
+with st.sidebar:
+    st.subheader("Resume an existing run")
+    existing = _list_runs_for_user(username)
+    selected_run = st.selectbox("Pick a Run ID", ["(none)"] + existing, index=0)
+    auto_continue_sidebar = st.toggle("Auto-continue generation", value=True, key="auto_continue_sidebar")
+    if selected_run != "(none)":
+        if st.button("Load Run"):
+            run = _load_run(username, selected_run)
+            if run:
+                st.session_state.evm_run_id = selected_run
+                st.session_state.evm_run = run
+                st.session_state.evm_model = run.get("model", DEFAULT_MODEL)
+                st.session_state.evm_logs = run.get("logs", [])
+                st.success(f"Loaded run {selected_run}")
+            else:
+                st.error("Could not load selected run (file missing or corrupted).")
 
 # Intake
 with st.form("evm_intake_form"):
@@ -461,102 +546,110 @@ with st.form("evm_intake_form"):
     area = st.text_input("AREA (optional)", key="evm_area")
     sides = st.multiselect("SIDES", options=["Pro", "Con"], default=["Pro", "Con"], key="evm_sides")
     total_cards = st.slider("TOTAL_CARDS", min_value=40, max_value=200, value=100, step=10, key="evm_total_cards")
-    # batch_size kept (hidden “hint” for model)? You asked model to decide; we keep field for future use if needed.
-    batch_size = st.number_input("BATCH_SIZE (optional hint)", min_value=10, max_value=50, value=20, step=1, key="evm_batch_size")
     model = st.text_input("Model", value=st.session_state.get("evm_model", DEFAULT_MODEL))
-    submit_intake = st.form_submit_button("Build Evidence Packet")
+    auto_continue = st.toggle("Auto-continue after each batch", value=True, key="auto_continue")
+    submit_intake = st.form_submit_button("Start New Run")
 
 if submit_intake:
     if not resolution.strip():
         st.error("RESOLUTION is required.")
         st.stop()
 
-    st.session_state.evm_intake = {
-        "resolution": resolution.strip(),
-        "area": area.strip(),
-        "sides": sides or ["Pro", "Con"],
-        "total_cards": int(total_cards),
-        "batch_size": int(batch_size),  # hint only; model chooses final sizing
+    run_id = uuid.uuid4().hex[:8]
+    new_run = {
+        "run_id": run_id,
+        "username": username,
+        "model": (model or DEFAULT_MODEL).strip(),
+        "intake": {
+            "resolution": resolution.strip(),
+            "area": area.strip(),
+            "sides": sides or ["Pro", "Con"],
+            "total_cards": int(total_cards),
+        },
+        "plan_text": "",
+        "batches": [],
+        "seen_set": [],
+        "logs": [],
+        "total_generated": 0,
+        "created_at": int(time.time()),
     }
-    st.session_state.evm_model = (model or DEFAULT_MODEL).strip()
-    st.session_state.evm_batches = []
-    st.session_state.evm_seen_set = set()
-    st.session_state.evm_total_generated = 0
+    _save_run(username, new_run)
 
+    st.session_state.evm_run_id = run_id
+    st.session_state.evm_run = new_run
+    st.session_state.evm_model = new_run["model"]
+    st.session_state.evm_logs = []
+
+    # kick off first steps immediately
     try:
-        # One unified status box with streaming stages
-        with st.status("Starting…", state="running", expanded=True) as status:
-            status.write("Drafting batch plan…")
-            plan_text = _propose_plan(st.session_state.evm_intake, st.session_state.evm_model)
-            st.session_state.evm_plan_text = plan_text
-            status.write("Batch plan ready.")
-
-            target_total = st.session_state.evm_intake["total_cards"]
-            status.update(label=f"Generating evidence batches (target ≈ {target_total} cards)…", state="running")
-
-            batch_num = 1
-            MAX_BATCHES = 50  # hard stop to avoid runaway loops
-
-            while st.session_state.evm_total_generated < target_total and batch_num <= MAX_BATCHES:
-                status.write(f"Generating batch {batch_num}…")
-
-                # Build seen list from all prior batches
-                seen_pairs: List[Tuple[str, str]] = []
-                for b in st.session_state.evm_batches:
-                    for c in b:
-                        k = _seen_key(c)
-                        if not k:
-                            continue
-                        u, q = k.split("||", 1)
-                        seen_pairs.append((u, q))
-
-                # Generate one batch
-                batch_cards = _generate_batch(
-                    st.session_state.evm_intake,
-                    st.session_state.evm_plan_text,
-                    batch_num,
-                    st.session_state.evm_model,
-                    seen_pairs,
-                )
-
-                # De-dupe against global seen set
-                new_batch: List[Dict[str, Any]] = []
-                dups = 0
-                for c in batch_cards:
-                    k = _seen_key(c)
-                    if not k:
-                        continue
-                    if k in st.session_state.evm_seen_set:
-                        dups += 1
-                        continue
-                    st.session_state.evm_seen_set.add(k)
-                    new_batch.append(c)
-
-                st.session_state.evm_batches.append(new_batch)
-                st.session_state.evm_total_generated += len(new_batch)
-
-                status.write(f"Batch {batch_num} complete ({len(new_batch)} cards; total so far: {st.session_state.evm_total_generated}/{target_total}).")
-                batch_num += 1
-
-            status.update(label="Evidence batches complete.", state="complete")
-
-        # Create merged Excel and show a single download button
-        all_cards = [c for b in st.session_state.evm_batches for c in b]
-        bio = _merge_to_excel(all_cards)
-        if bio is not None:
-            st.download_button(
-                label="⬇️ Download Evidence.xlsx",
-                data=bio,
-                file_name="evidence_pack.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-        else:
-            st.error(
-                "Could not create Excel file because no Excel writer engine is installed. "
-                "Add either 'xlsxwriter' (preferred) or an Excel engine to your environment."
-            )
-
+        _resume_or_start_generation(username, st.session_state.evm_run, auto_continue=auto_continue)
         log_query(username, TOOL_NAME, True)
     except Exception as e:
         log_query(username, TOOL_NAME, False, feedback=str(e))
-        st.error(f"Build failed: {e}")
+        st.error(f"Error during generation: {e}")
+
+# If there's an active run in session, show console/progress + actions
+if st.session_state.evm_run:
+    run = st.session_state.evm_run
+    intake = run["intake"]
+    target_total = intake["total_cards"]
+
+    st.markdown(f"**Run ID:** `{run['run_id']}`  •  **Target:** {target_total} cards  •  **Generated so far:** {run['total_generated']}")
+
+    # show logs (persisted)
+    st.divider()
+    st.subheader("Progress")
+    logs_container = st.container()
+    with logs_container:
+        for line in run.get("logs", []):
+            st.write("• " + line)
+
+    # Action buttons
+    st.divider()
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        if st.button("▶️ Generate Next Batch"):
+            try:
+                _resume_or_start_generation(username, run, auto_continue=False)
+                st.session_state.evm_logs = run.get("logs", [])
+                st.success("Next batch generated.")
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+    with c2:
+        if st.button("⏩ Auto-Continue Until Done"):
+            try:
+                _resume_or_start_generation(username, run, auto_continue=True)
+                st.session_state.evm_logs = run.get("logs", [])
+                st.success("Auto-continue step completed.")
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+    with c3:
+        if st.button("🧹 Finish & Merge Now"):
+            pass  # just a UI affordance; merge button is below and always available
+
+    # Show last batch JSON for quick inspection
+    if run.get("batches"):
+        last_batch = run["batches"][-1]
+        st.markdown("**Latest Batch (JSON preview):**")
+        st.code(json.dumps(last_batch, ensure_ascii=False, indent=2))
+
+    # Merge/export (available anytime)
+    st.subheader("Download")
+    all_cards = [c for b in run.get("batches", []) for c in b]
+    bio = _merge_to_excel(all_cards)
+    if bio is not None:
+        st.download_button(
+            label="⬇️ Download Evidence.xlsx",
+            data=bio,
+            file_name=f"evidence_{run['run_id']}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    else:
+        st.error(
+            "Could not create Excel file because no Excel writer engine is installed. "
+            "Add 'xlsxwriter' to your environment for best results."
+        )
+else:
+    st.info("Start a new run above, or use the sidebar to load an existing run.")
