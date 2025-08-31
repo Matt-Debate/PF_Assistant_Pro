@@ -102,8 +102,8 @@ Output: A concise, numbered plan in prose. Do not produce any cards yet.
         input=[
             {"role": "system", "content": sys},
             {"role": "user", "content": user},
+        reasoning={ "effort": "high" },
         ],
-        temperature=0,
     )
     return _get_output_text(resp).strip()
 
