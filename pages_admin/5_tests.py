@@ -338,9 +338,9 @@ def _merge_to_excel(all_cards: List[Dict[str, Any]]) -> BytesIO | None:
                 "Authors": cit.get("authors", ""),
                 "Year": cit.get("year", ""),
                 "Date": cit.get("date", ""),
-                "Title": cit.get("title", ""),   # <- from citation
-                "Source": cit.get("source", ""), # <- from citation
-                "URL": cit.get("url", ""),       # <- from citation
+                "Title": cit.get("title", ""),   # from citation
+                "Source": cit.get("source", ""), # from citation
+                "URL": cit.get("url", ""),       # from citation
                 "Quote": c.get("quote", ""),
                 "Flow Sentence": c.get("flow_sentence", ""),
             }
@@ -379,6 +379,7 @@ def _merge_to_excel(all_cards: List[Dict[str, Any]]) -> BytesIO | None:
 
     # If we get here, no Excel engines were available
     return None
+
 
 # --- UI ---
 st.title("📚 Evidence Pack Machine (Planner + Batches)")
@@ -658,6 +659,7 @@ st.markdown("### Merge All Batches → Excel")
 if st.button("Merge"):
     try:
         all_cards = [c for b in st.session_state.evm_batches for c in b]
+        # de-dupe by (url, quote)
         seen = set()
         merged: List[Dict[str, Any]] = []
         for c in all_cards:
@@ -665,6 +667,7 @@ if st.button("Merge"):
             if k and k not in seen:
                 seen.add(k)
                 merged.append(c)
+
         bio = _merge_to_excel(merged)
         if bio is not None:
             st.download_button(
@@ -678,57 +681,5 @@ if st.button("Merge"):
                 "Could not create Excel file because no Excel writer engine is installed. "
                 "Add either 'openpyxl' or 'xlsxwriter' to your environment (requirements) and try again."
             )
-import json, glob
-import pandas as pd
-
-def load_batches(pattern='batch_*.json'):
-    cards = []
-    for path in sorted(glob.glob(pattern)):
-        with open(path, 'r', encoding='utf-8') as f:
-            batch = json.load(f)
-            cards.extend(batch)
-    return cards
-
-cards = load_batches()
-# De-dupe by (url, quote)
-seen = set()
-merged = []
-for c in cards:
-    url = (c.get('citation') or {}).get('url','').strip()
-    quote = (c.get('quote') or '').strip()
-    k = f"{url}||{quote}"
-    if k and k not in seen:
-        seen.add(k)
-        merged.append(c)
-
-rows = []
-for c in merged:
-    cit = c.get('citation') or {}
-    rows.append({
-        'Side': c.get('side',''),
-        'Function': c.get('function',''),
-        'Tag': c.get('tag',''),
-        'Authors': cit.get('authors',''),
-        'Year': cit.get('year',''),
-        'Date': cit.get('date',''),
-        'Title': cit.get('title',''),
-        'Source': cit.get('source',''),
-        'URL': cit.get('url',''),
-        'Quote': c.get('quote',''),
-        'Flow Sentence': c.get('flow_sentence',''),
-    })
-
-df_cards = pd.DataFrame(rows)
-df_index = pd.DataFrame([
-    {'#': i+1, 'Side': r['Side'], 'Function': r['Function'], 'Tag': r['Tag'], 'Year': r['Year'], 'Source': r['Source'], 'Title': r['Title'], 'URL': r['URL']} 
-    for i, r in enumerate(rows)
-])
-
-with pd.ExcelWriter('evidence_pack.xlsx', engine='xlsxwriter') as w:
-    df_cards.to_excel(w, sheet_name='Cards', index=False)
-    df_index.to_excel(w, sheet_name='Quick Index', index=False)
-print('Wrote evidence_pack.xlsx')
-"""
-            st.code(snippet, language="python")
     except Exception as e:
         st.error(f"Merge failed: {e}")
