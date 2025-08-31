@@ -509,7 +509,7 @@ with c_next1:
     if current_n <= total_batches and st.button(f"✅ Accept Batch {last_idx} & Generate Batch {current_n}"):
         try:
             # Build seen list
-            seen_list = []
+            seen_list: List[Tuple[str, str]] = []
             for b in st.session_state.evm_batches:
                 for c in b:
                     k = _seen_key(c)
@@ -561,91 +561,33 @@ with c_next2:
                     st.session_state.evm_seen_set.remove(k)
             st.session_state.evm_current_batch = max(1, current_n - 1)
             st.info("Last batch removed. Click Generate to redo it.")
-            
-# Under: if st.session_state.evm_batches:
-last_batch = st.session_state.evm_batches[-1]
-last_idx = len(st.session_state.evm_batches)
-current_n = st.session_state.get("evm_current_batch", 1)
-total_cards = int(st.session_state.evm_intake.get("total_cards", 240))
-batch_size = int(st.session_state.evm_intake.get("batch_size", 20))
-total_batches = max(1, (total_cards + batch_size - 1) // batch_size)
 
-c_next1, c_next2 = st.columns(2)
-with c_next1:
-    if current_n <= total_batches and st.button(f"✅ Accept Batch {last_idx} & Generate Batch {current_n}"):
-        try:
-            # Build seen list
-            seen_list = []
-            for b in st.session_state.evm_batches:
-                for c in b:
-                    k = _seen_key(c)
-                    if not k:
-                        continue
-                    url, quote = k.split("||", 1)
-                    seen_list.append((url, quote))
+# Keep “Fix a Card” visible at this level (not nested inside a button)
+st.markdown("#### Fix a Card in Last Batch")
+fix_idx = st.number_input(
+    "Card # to replace (1-based)",
+    min_value=1,
+    max_value=max(1, len(last_batch)),
+    value=1
+)
+if st.button("Fix #N in Last Batch"):
+    try:
+        client = _get_oai()
 
-            with st.spinner(f"Generating batch {current_n}..."):
-                next_cards = _generate_batch(
-                    st.session_state.evm_intake,
-                    st.session_state.evm_plan_text,
-                    current_n,
-                    st.session_state.evm_model,
-                    seen_list,
-                )
+        header = _batch_prompt_header(st.session_state.evm_intake)
+        rules = _quality_rules_block()
+        schema = _schema_block()
 
-            # De-dup vs global seen set
-            new_batch = []
-            dups = 0
-            for c in next_cards:
-                key = _seen_key(c)
-                if not key:
-                    continue
-                if key in st.session_state.evm_seen_set:
-                    dups += 1
-                    continue
-                st.session_state.evm_seen_set.add(key)
-                new_batch.append(c)
-
-            if dups > 0:
-                st.warning(f"Removed {dups} duplicate card(s) that repeated a prior (url, quote).")
-
-            st.session_state.evm_batches.append(new_batch)
-            st.session_state.evm_current_batch = current_n + 1
-            st.success(f"Batch {current_n} generated with {len(new_batch)} cards.")
-        except Exception as e:
-            st.error(f"Batch generation failed: {e}")
-
-with c_next2:
-    if st.button("🔁 Regenerate This Batch Instead"):
-        # Remove last batch and decrement current_n so you can rerun it
-        if st.session_state.evm_batches:
-            removed = st.session_state.evm_batches.pop()
-            # Also clean their seen keys
-            for c in removed:
+        # Build context (exclude last batch so we can replace within it freely)
+        seen_list: List[Tuple[str, str]] = []
+        for b in st.session_state.evm_batches[:-1]:
+            for c in b:
                 k = _seen_key(c)
-                if k and k in st.session_state.evm_seen_set:
-                    st.session_state.evm_seen_set.remove(k)
-            st.session_state.evm_current_batch = max(1, current_n - 1)
-            st.info("Last batch removed. Click Generate to redo it.")
-        st.markdown("#### Fix a Card in Last Batch")
-        fix_idx = st.number_input("Card # to replace (1-based)", min_value=1, max_value=max(1, len(last_batch)), value=1)
-        if st.button("Fix #N in Last Batch"):
-            try:
-                client = _get_oai()
+                if k:
+                    u, q = k.split("||", 1)
+                    seen_list.append((u, q))
 
-                header = _batch_prompt_header(st.session_state.evm_intake)
-                rules = _quality_rules_block()
-                schema = _schema_block()
-
-                seen_list: List[Tuple[str, str]] = []
-                for b in st.session_state.evm_batches[:-1]:
-                    for c in b:
-                        k = _seen_key(c)
-                        if k:
-                            u, q = k.split("||", 1)
-                            seen_list.append((u, q))
-
-                user = f"""
+        user = f"""
 {header}
 
 We are correcting one card in the most recent batch. Replace the card with index {int(fix_idx)} in that batch with a new, valid card that obeys all rules. Do not duplicate any (url, exact quote) from this seen set across prior batches:
@@ -657,52 +599,51 @@ Return JSON with exactly ONE card in the wrapped form {{ "cards": [ ... ] }}. Do
 {schema}
 """
 
-                card_schema = _card_schema()
-                wrapped_schema = _cards_envelope_schema(card_schema, min_items=1, max_items=1)
+        card_schema = _card_schema()
+        wrapped_schema = _cards_envelope_schema(card_schema, min_items=1, max_items=1)
 
-                resp = client.chat.completions.create(
-                    model=st.session_state.evm_model,
-                    messages=[
-                        {"role": "system", "content": "You cut debate evidence cards with meticulous sourcing and formatting."},
-                        {"role": "user", "content": user},
-                    ],
-            
-                    response_format={
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": "one_card_object_envelope",
-                            "schema": wrapped_schema,
-                            "strict": True,
-                        },
-                    },
-                )
+        resp = client.chat.completions.create(
+            model=st.session_state.evm_model,
+            messages=[
+                {"role": "system", "content": "You cut debate evidence cards with meticulous sourcing and formatting."},
+                {"role": "user", "content": user},
+            ],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "one_card_object_envelope",
+                    "schema": wrapped_schema,
+                    "strict": True,
+                },
+            },
+        )
 
-                obj = _get_parsed_json(resp)
-                if obj is None:
-                    raw = _get_output_text(resp).strip()
-                    try:
-                        obj = json.loads(raw)
-                    except Exception:
-                        raise ValueError("Model did not return valid JSON.")
+        obj = _get_parsed_json(resp)
+        if obj is None:
+            raw = _get_output_text(resp).strip()
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                raise ValueError("Model did not return valid JSON.")
 
-                repl_cards = _ensure_cards_list(obj)
-                if not isinstance(repl_cards, list) or len(repl_cards) != 1:
-                    raise ValueError("Model did not return exactly one card in 'cards'.")
+        repl_cards = _ensure_cards_list(obj)
+        if not isinstance(repl_cards, list) or len(repl_cards) != 1:
+            raise ValueError("Model did not return exactly one card in 'cards'.")
 
-                replacement = repl_cards[0]
+        replacement = repl_cards[0]
 
-                old_key = _seen_key(last_batch[int(fix_idx) - 1])
-                if old_key and old_key in st.session_state.evm_seen_set:
-                    st.session_state.evm_seen_set.remove(old_key)
-                new_key = _seen_key(replacement)
-                if new_key in st.session_state.evm_seen_set:
-                    raise ValueError("Replacement duplicates an existing (url, quote). Try again.")
-                st.session_state.evm_seen_set.add(new_key)
-                last_batch[int(fix_idx) - 1] = replacement
-                st.success(f"Replaced card #{int(fix_idx)} in last batch.")
-            except Exception as e:
-                st.error(f"Fix failed: {e}")
-
+        # Update seen set (remove old key, add new)
+        old_key = _seen_key(last_batch[int(fix_idx) - 1])
+        if old_key and old_key in st.session_state.evm_seen_set:
+            st.session_state.evm_seen_set.remove(old_key)
+        new_key = _seen_key(replacement)
+        if new_key in st.session_state.evm_seen_set:
+            raise ValueError("Replacement duplicates an existing (url, quote). Try again.")
+        st.session_state.evm_seen_set.add(new_key)
+        last_batch[int(fix_idx) - 1] = replacement
+        st.success(f"Replaced card #{int(fix_idx)} in last batch.")
+    except Exception as e:
+        st.error(f"Fix failed: {e}")
 # Merge/export
 st.markdown("### Merge All Batches → Excel")
 if st.button("Merge"):
