@@ -38,19 +38,16 @@ def _get_output_text(resp) -> str:
     - Chat Completions: resp.choices[0].message.content (or .parsed if available).
     Fallback: str(resp).
     """
-    # 1) New Responses API convenience field
     if hasattr(resp, "output_text"):
         text = getattr(resp, "output_text")
         if isinstance(text, str) and text.strip():
             return text
 
-    # 2) Chat Completions shape
     try:
         choices = getattr(resp, "choices", None)
         if choices and len(choices) > 0:
             msg = getattr(choices[0], "message", None)
             if msg is not None:
-                # If the SDK parsed JSON per schema, it may be in .parsed
                 parsed = getattr(msg, "parsed", None)
                 if parsed is not None:
                     try:
@@ -86,7 +83,6 @@ def _get_parsed_json(resp) -> Any:
                     return json.loads(content)
     except Exception:
         pass
-    # Final fallback: try whatever string we can extract
     text = _get_output_text(resp)
     try:
         return json.loads(text)
@@ -125,9 +121,7 @@ def _propose_plan(intake: Dict[str, Any], model: str) -> str:
     total_cards = int(intake.get("total_cards", 240))
     batch_size = int(intake.get("batch_size", 20))
 
-    sys = (
-        "You are a debate coach planning an evidence pack across batches."
-    )
+    sys = "You are a debate coach planning an evidence pack across batches."
     user = f"""
 OBJECTIVE
 Produce an expansive evidence pack of {total_cards} cards using {batch_size}-card batches.
@@ -147,12 +141,12 @@ Use the taxonomy: Definitions & frameworks; Economy/exports/productivity; Border
 Output: A concise, numbered plan in prose. Do not produce any cards yet.
 """
 
-    # Plain text plan -> Responses API is fine
     resp = client.responses.create(
         model=model,
         input=[
             {"role": "system", "content": sys},
-            {"role": "user", "content": user}],
+            {"role": "user", "content": user}
+        ],
         reasoning={"effort": "high"},
     )
     return _get_output_text(resp).strip()
@@ -168,7 +162,7 @@ def _batch_prompt_header(intake: Dict[str, Any]) -> str:
 def _schema_block() -> str:
     return (
         """
-STRICT CARD SCHEMA (Return JSON ONLY; now wrapped as {"cards":[...]} )
+STRICT CARD SCHEMA (Return JSON ONLY; wrapped as {"cards":[...]} )
 {
   "cards": [
     {
@@ -226,6 +220,51 @@ def _cards_envelope_schema(item_schema: Dict[str, Any], min_items: int = 1, max_
     }
 
 
+def _card_schema() -> Dict[str, Any]:
+    """
+    Card object schema with strict nested object rules (additionalProperties = false).
+    """
+    return {
+        "type": "object",
+        "properties": {
+            "side": {"type": "string", "enum": ["Pro", "Con"]},
+            "function": {"type": "string"},
+            "tag": {"type": "string"},
+            "citation": {
+                "type": "object",
+                "properties": {
+                    "authors": {"type": "string"},
+                    "year": {"type": "string"},
+                    "date": {"type": "string"},
+                    "title": {"type": "string"},
+                    "source": {"type": "string"},
+                    "url": {"type": "string"},
+                },
+                "required": ["authors", "year", "date", "title", "source", "url"],
+                "additionalProperties": False,  # <- strict per docs
+            },
+            "quote": {"type": "string"},
+            "underline_phrases": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 2,
+                "maxItems": 5,
+            },
+            "flow_sentence": {"type": "string"},
+        },
+        "required": [
+            "side",
+            "function",
+            "tag",
+            "citation",
+            "quote",
+            "underline_phrases",
+            "flow_sentence",
+        ],
+        "additionalProperties": False,  # <- strict per docs
+    }
+
+
 def _generate_batch(
     intake: Dict[str, Any], plan_text: str, batch_num: int, model: str, seen: List[Tuple[str, str]]
 ) -> List[Dict[str, Any]]:
@@ -254,51 +293,9 @@ Use this seen set of (url, exact quote) already used in prior batches; do not re
 {schema}
 """
 
-    # Single card schema
-    card_schema = {
-        "type": "object",
-        "properties": {
-            "side": {"type": "string", "enum": ["Pro", "Con"]},
-            "function": {"type": "string"},
-            "tag": {"type": "string"},
-            "citation": {
-                "type": "object",
-                "properties": {
-                    "authors": {"type": "string"},
-                    "year": {"type": "string"},
-                    "date": {"type": "string"},
-                    "title": {"type": "string"},
-                    "source": {"type": "string"},
-                    "url": {"type": "string"},
-                },
-                "required": ["authors", "year", "date", "title", "source", "url"],
-                "additionalProperties": True,
-            },
-            "quote": {"type": "string"},
-            "underline_phrases": {
-                "type": "array",
-                "items": {"type": "string"},
-                "minItems": 2,
-                "maxItems": 5,
-            },
-            "flow_sentence": {"type": "string"},
-        },
-        "required": [
-            "side",
-            "function",
-            "tag",
-            "citation",
-            "quote",
-            "underline_phrases",
-            "flow_sentence",
-        ],
-        "additionalProperties": False,
-    }
-
-    # Wrapped object schema: {"cards":[ ... ]}
+    card_schema = _card_schema()
     wrapped_schema = _cards_envelope_schema(card_schema, min_items=1)
 
-    # Chat Completions with Structured Outputs
     resp = client.chat.completions.create(
         model=model,
         messages=[
@@ -318,7 +315,6 @@ Use this seen set of (url, exact quote) already used in prior batches; do not re
 
     obj = _get_parsed_json(resp)
     if obj is None:
-        # Final fallback to text parsing
         raw = _get_output_text(resp).strip()
         try:
             obj = json.loads(raw)
@@ -331,7 +327,6 @@ Use this seen set of (url, exact quote) already used in prior batches; do not re
 
 
 def _merge_to_excel(all_cards: List[Dict[str, Any]]) -> BytesIO | None:
-    # Build DataFrames
     rows_cards = []
     for c in all_cards:
         cit = c.get("citation", {}) or {}
@@ -404,7 +399,6 @@ if submit_intake:
     if not resolution.strip():
         st.error("RESOLUTION is required.")
         st.stop()
-    # Save intake
     st.session_state.evm_intake = {
         "resolution": resolution.strip(),
         "area": area.strip(),
@@ -453,7 +447,6 @@ if st.session_state.get("evm_plan_approved"):
     if current_n <= total_batches:
         if st.button(f"Generate Batch {current_n}"):
             try:
-                # Build seen list for prompt
                 seen_list: List[Tuple[str, str]] = []
                 for batch in st.session_state.evm_batches:
                     for card in batch:
@@ -472,7 +465,6 @@ if st.session_state.get("evm_plan_approved"):
                         seen_list,
                     )
 
-                # De-dup against seen set
                 new_batch = []
                 dups = 0
                 for c in batch_cards:
@@ -494,7 +486,6 @@ if st.session_state.get("evm_plan_approved"):
             except Exception as e:
                 st.error(f"Batch generation failed: {e}")
 
-    # Show latest batch
     if st.session_state.evm_batches:
         st.markdown("### Latest Batch JSON")
         last_batch = st.session_state.evm_batches[-1]
@@ -506,7 +497,6 @@ if st.session_state.get("evm_plan_approved"):
             mime="application/json",
         )
 
-        # Fix a card in the last batch
         st.markdown("#### Fix a Card in Last Batch")
         fix_idx = st.number_input("Card # to replace (1-based)", min_value=1, max_value=max(1, len(last_batch)), value=1)
         if st.button("Fix #N in Last Batch"):
@@ -517,9 +507,8 @@ if st.session_state.get("evm_plan_approved"):
                 rules = _quality_rules_block()
                 schema = _schema_block()
 
-                # Build a brief context on what to replace
                 seen_list: List[Tuple[str, str]] = []
-                for b in st.session_state.evm_batches[:-1]:  # all but last
+                for b in st.session_state.evm_batches[:-1]:
                     for c in b:
                         k = _seen_key(c)
                         if k:
@@ -538,50 +527,9 @@ Return JSON with exactly ONE card in the wrapped form {{ "cards": [ ... ] }}. Do
 {schema}
 """
 
-                # Single-card schema (same as above)
-                card_schema = {
-                    "type": "object",
-                    "properties": {
-                        "side": {"type": "string", "enum": ["Pro", "Con"]},
-                        "function": {"type": "string"},
-                        "tag": {"type": "string"},
-                        "citation": {
-                            "type": "object",
-                            "properties": {
-                                "authors": {"type": "string"},
-                                "year": {"type": "string"},
-                                "date": {"type": "string"},
-                                "title": {"type": "string"},
-                                "source": {"type": "string"},
-                                "url": {"type": "string"},
-                            },
-                            "required": ["authors", "year", "date", "title", "source", "url"],
-                            "additionalProperties": True,
-                        },
-                        "quote": {"type": "string"},
-                        "underline_phrases": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "minItems": 2,
-                            "maxItems": 5,
-                        },
-                        "flow_sentence": {"type": "string"},
-                    },
-                    "required": [
-                        "side",
-                        "function",
-                        "tag",
-                        "citation",
-                        "quote",
-                        "underline_phrases",
-                        "flow_sentence",
-                    ],
-                    "additionalProperties": False,
-                }
-
+                card_schema = _card_schema()
                 wrapped_schema = _cards_envelope_schema(card_schema, min_items=1, max_items=1)
 
-                # Chat Completions with Structured Outputs
                 resp = client.chat.completions.create(
                     model=st.session_state.evm_model,
                     messages=[
@@ -613,7 +561,6 @@ Return JSON with exactly ONE card in the wrapped form {{ "cards": [ ... ] }}. Do
 
                 replacement = repl_cards[0]
 
-                # Update seen set (remove old key, add new)
                 old_key = _seen_key(last_batch[int(fix_idx) - 1])
                 if old_key and old_key in st.session_state.evm_seen_set:
                     st.session_state.evm_seen_set.remove(old_key)
@@ -626,32 +573,31 @@ Return JSON with exactly ONE card in the wrapped form {{ "cards": [ ... ] }}. Do
             except Exception as e:
                 st.error(f"Fix failed: {e}")
 
-    # Merge/export
-    st.markdown("### Merge All Batches → Excel")
-    if st.button("Merge"):
-        try:
-            all_cards = [c for b in st.session_state.evm_batches for c in b]
-            # de-dupe by identical (url, quote)
-            seen = set()
-            merged: List[Dict[str, Any]] = []
-            for c in all_cards:
-                k = _seen_key(c)
-                if k and k not in seen:
-                    seen.add(k)
-                    merged.append(c)
-            bio = _merge_to_excel(merged)
-            if bio is not None:
-                st.download_button(
-                    label="Download Evidence.xlsx",
-                    data=bio,
-                    file_name="evidence_pack.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-            else:
-                st.info(
-                    "Excel engine not available. Use this Python snippet locally to merge JSON files and write Excel."
-                )
-                snippet = """
+# Merge/export
+st.markdown("### Merge All Batches → Excel")
+if st.button("Merge"):
+    try:
+        all_cards = [c for b in st.session_state.evm_batches for c in b]
+        seen = set()
+        merged: List[Dict[str, Any]] = []
+        for c in all_cards:
+            k = _seen_key(c)
+            if k and k not in seen:
+                seen.add(k)
+                merged.append(c)
+        bio = _merge_to_excel(merged)
+        if bio is not None:
+            st.download_button(
+                label="Download Evidence.xlsx",
+                data=bio,
+                file_name="evidence_pack.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        else:
+            st.info(
+                "Excel engine not available. Use this Python snippet locally to merge JSON files and write Excel."
+            )
+            snippet = """
 import json, glob
 import pandas as pd
 
@@ -703,6 +649,6 @@ with pd.ExcelWriter('evidence_pack.xlsx', engine='xlsxwriter') as w:
     df_index.to_excel(w, sheet_name='Quick Index', index=False)
 print('Wrote evidence_pack.xlsx')
 """
-                st.code(snippet, language="python")
-        except Exception as e:
-            st.error(f"Merge failed: {e}")
+            st.code(snippet, language="python")
+    except Exception as e:
+        st.error(f"Merge failed: {e}")
