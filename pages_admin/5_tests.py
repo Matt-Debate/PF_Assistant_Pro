@@ -9,7 +9,7 @@ from openai import OpenAI
 
 # --- Constants ---
 TOOL_NAME = "evidence_machine"
-DEFAULT_MODEL = "gpt-5"  
+DEFAULT_MODEL = "gpt-5"  # Planning call uses Responses API without response_format
 
 
 # --- Helpers ---
@@ -32,14 +32,40 @@ def _get_oai() -> OpenAI:
 
 
 def _get_output_text(resp) -> str:
-    # Best-effort extraction for Responses API
-    text = None
-    for attr in ("output_text",):
-        if hasattr(resp, attr):
-            text = getattr(resp, attr)
-            if isinstance(text, str) and text.strip():
-                return text
-    # Fallback: try to stringify
+    """
+    Best-effort extraction for both Responses API objects and Chat Completions objects.
+    - Responses API: prefer resp.output_text if available.
+    - Chat Completions: resp.choices[0].message.content (or .parsed if available).
+    Fallback: str(resp).
+    """
+    # 1) New Responses API convenience field
+    if hasattr(resp, "output_text"):
+        text = getattr(resp, "output_text")
+        if isinstance(text, str) and text.strip():
+            return text
+
+    # 2) Chat Completions shape
+    try:
+        # Some SDKs expose a .model_dump() style dict, but we try object access first
+        choices = getattr(resp, "choices", None)
+        if choices and len(choices) > 0:
+            msg = getattr(choices[0], "message", None)
+            if msg is not None:
+                # If the SDK parsed JSON per schema, it may be in .parsed
+                parsed = getattr(msg, "parsed", None)
+                if parsed is not None:
+                    # Ensure string for downstream handling
+                    try:
+                        return json.dumps(parsed, ensure_ascii=False)
+                    except Exception:
+                        pass
+                content = getattr(msg, "content", None)
+                if isinstance(content, str) and content.strip():
+                    return content
+    except Exception:
+        pass
+
+    # 3) Fallback to string
     try:
         return str(resp)
     except Exception:
@@ -97,12 +123,13 @@ Use the taxonomy: Definitions & frameworks; Economy/exports/productivity; Border
 Output: A concise, numbered plan in prose. Do not produce any cards yet.
 """
 
+    # This call does NOT use response_format; leaving as Responses API since it works for you.
     resp = client.responses.create(
         model=model,
         input=[
             {"role": "system", "content": sys},
             {"role": "user", "content": user}],
-        reasoning={ "effort": "high" },
+        reasoning={"effort": "high"},
     )
     return _get_output_text(resp).strip()
 
@@ -182,7 +209,7 @@ Use this seen set of (url, exact quote) already used in prior batches; do not re
 {schema}
 """
 
-    # Structured output using JSON Schema (agentic feature)
+    # Structured output schema for a single card item
     card_schema = {
         "type": "object",
         "properties": {
@@ -223,9 +250,10 @@ Use this seen set of (url, exact quote) already used in prior batches; do not re
         "additionalProperties": False,
     }
 
-    resp = client.responses.create(
+    # --- CHANGED: use Chat Completions with response_format (Structured Outputs) ---
+    resp = client.chat.completions.create(
         model=model,
-        input=[
+        messages=[
             {"role": "system", "content": "You cut debate evidence cards with meticulous sourcing and formatting."},
             {"role": "user", "content": user},
         ],
@@ -459,7 +487,7 @@ Return a JSON array with exactly ONE card following the schema below. Do not inc
 {schema}
 """
 
-                # Single-card structured output
+                # Single-card structured output schema
                 card_schema = {
                     "type": "object",
                     "properties": {
@@ -500,9 +528,10 @@ Return a JSON array with exactly ONE card following the schema below. Do not inc
                     "additionalProperties": False,
                 }
 
-                resp = client.responses.create(
+                # --- CHANGED: use Chat Completions with response_format (Structured Outputs) ---
+                resp = client.chat.completions.create(
                     model=st.session_state.evm_model,
-                    input=[
+                    messages=[
                         {"role": "system", "content": "You cut debate evidence cards with meticulous sourcing and formatting."},
                         {"role": "user", "content": user},
                     ],
@@ -616,6 +645,3 @@ print('Wrote evidence_pack.xlsx')
                 st.code(snippet, language="python")
         except Exception as e:
             st.error(f"Merge failed: {e}")
-
-
-
