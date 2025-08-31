@@ -101,9 +101,8 @@ Output: A concise, numbered plan in prose. Do not produce any cards yet.
         model=model,
         input=[
             {"role": "system", "content": sys},
-            {"role": "user", "content": user},
+            {"role": "user", "content": user}],
         reasoning={ "effort": "high" },
-        ],
     )
     return _get_output_text(resp).strip()
 
