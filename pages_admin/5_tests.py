@@ -516,7 +516,7 @@ with st.form("evm_intake_form"):
     resolution = st.text_area("RESOLUTION (required)", key="evm_resolution", height=100)
     area = st.text_input("AREA (optional)", key="evm_area")
     sides = st.multiselect("SIDES", options=["Pro", "Con"], default=["Pro", "Con"], key="evm_sides")
-    total_cards = st.slider("TOTAL_CARDS", min_value=200, max_value=300, value=240, step=10, key="evm_total_cards")
+    total_cards = st.slider("TOTAL_CARDS", min_value=50, max_value=300, value=240, step=10, key="evm_total_cards")
     batch_size = st.number_input("BATCH_SIZE", min_value=10, max_value=50, value=20, step=1, key="evm_batch_size")
     model = st.text_input("Model", value=st.session_state.get("evm_model", DEFAULT_MODEL))
     submit_intake = st.form_submit_button("Propose Batch Plan")
