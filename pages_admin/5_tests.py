@@ -454,7 +454,6 @@ _init_state()
 
 username = get_username()
 remaining = get_remaining_queries(username, tool=TOOL_NAME) or 0
-st.caption(f"Remaining today for {TOOL_NAME}: {remaining}")
 
 # Intake
 with st.form("evm_intake_form"):
