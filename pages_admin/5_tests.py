@@ -46,7 +46,6 @@ def _get_output_text(resp) -> str:
 
     # 2) Chat Completions shape
     try:
-        # Some SDKs expose a .model_dump() style dict, but we try object access first
         choices = getattr(resp, "choices", None)
         if choices and len(choices) > 0:
             msg = getattr(choices[0], "message", None)
@@ -54,7 +53,6 @@ def _get_output_text(resp) -> str:
                 # If the SDK parsed JSON per schema, it may be in .parsed
                 parsed = getattr(msg, "parsed", None)
                 if parsed is not None:
-                    # Ensure string for downstream handling
                     try:
                         return json.dumps(parsed, ensure_ascii=False)
                     except Exception:
@@ -65,11 +63,48 @@ def _get_output_text(resp) -> str:
     except Exception:
         pass
 
-    # 3) Fallback to string
     try:
         return str(resp)
     except Exception:
         return ""
+
+
+def _get_parsed_json(resp) -> Any:
+    """
+    Prefer the SDK's validated parsed object; otherwise JSON-load the content.
+    """
+    try:
+        choices = getattr(resp, "choices", None)
+        if choices and len(choices) > 0:
+            msg = getattr(choices[0], "message", None)
+            if msg is not None:
+                parsed = getattr(msg, "parsed", None)
+                if parsed is not None:
+                    return parsed
+                content = getattr(msg, "content", None)
+                if isinstance(content, str) and content.strip():
+                    return json.loads(content)
+    except Exception:
+        pass
+    # Final fallback: try whatever string we can extract
+    text = _get_output_text(resp)
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
+
+
+def _ensure_cards_list(obj: Any) -> List[Dict[str, Any]]:
+    """
+    Accept either:
+      - {"cards": [ ... ]}  (preferred wrapped schema)
+      - [ ... ]             (legacy unwrapped; we normalize to list)
+    """
+    if isinstance(obj, dict) and "cards" in obj and isinstance(obj["cards"], list):
+        return obj["cards"]
+    if isinstance(obj, list):
+        return obj
+    raise ValueError("Model did not return JSON with a 'cards' array.")
 
 
 def _seen_key(card: Dict[str, Any]) -> str:
@@ -79,17 +114,6 @@ def _seen_key(card: Dict[str, Any]) -> str:
         return f"{url}||{quote}"
     except Exception:
         return ""
-
-
-def _clean_json_array_output(text: str) -> str:
-    if not text:
-        return "[]"
-    try:
-        start = text.index("[")
-        end = text.rindex("]") + 1
-        return text[start:end].strip()
-    except ValueError:
-        return text.strip()
 
 
 def _propose_plan(intake: Dict[str, Any], model: str) -> str:
@@ -123,7 +147,7 @@ Use the taxonomy: Definitions & frameworks; Economy/exports/productivity; Border
 Output: A concise, numbered plan in prose. Do not produce any cards yet.
 """
 
-    # This call does NOT use response_format; leaving as Responses API since it works for you.
+    # Plain text plan -> Responses API is fine
     resp = client.responses.create(
         model=model,
         input=[
@@ -144,25 +168,27 @@ def _batch_prompt_header(intake: Dict[str, Any]) -> str:
 def _schema_block() -> str:
     return (
         """
-STRICT CARD SCHEMA (Return a JSON array ONLY)
-[
-  {
-    "side": "Pro" | "Con",
-    "function": "Definitions" | "Economy Links" | "Agriculture Links" | "Impact Cards" | "Border/Customs" | "Maritime Connectivity" | "Energy Corridors" | "Resilience" | "Digital Trade/Logistics" | "Finance/PPP" | "Legal/Regulatory" | "Case Studies",
-    "tag": "short claim",
-    "citation": {
-      "authors": "Last & Last" | "Org Name",
-      "year": "YYYY",
-      "date": "YYYY-MM-DD",
-      "title": "Article or Report Title",
-      "source": "Publisher or Journal",
-      "url": "https://..."
-    },
-    "quote": "Full, direct, multi-sentence paragraph(s) from a single location on the page.",
-    "underline_phrases": ["phrase1","phrase2","phrase3"],
-    "flow_sentence": "One clean sentence that reads if the underlined phrases are stitched."
-  }
-]
+STRICT CARD SCHEMA (Return JSON ONLY; now wrapped as {"cards":[...]} )
+{
+  "cards": [
+    {
+      "side": "Pro" | "Con",
+      "function": "Definitions" | "Economy Links" | "Agriculture Links" | "Impact Cards" | "Border/Customs" | "Maritime Connectivity" | "Energy Corridors" | "Resilience" | "Digital Trade/Logistics" | "Finance/PPP" | "Legal/Regulatory" | "Case Studies",
+      "tag": "short claim",
+      "citation": {
+        "authors": "Last & Last" | "Org Name",
+        "year": "YYYY",
+        "date": "YYYY-MM-DD",
+        "title": "Article or Report Title",
+        "source": "Publisher or Journal",
+        "url": "https://..."
+      },
+      "quote": "Full, direct, multi-sentence paragraph(s) from a single location on the page.",
+      "underline_phrases": ["phrase1","phrase2","phrase3"],
+      "flow_sentence": "One clean sentence that reads if the underlined phrases are stitched."
+    }
+  ]
+}
 """
     ).strip()
 
@@ -182,6 +208,24 @@ QUALITY RULES
     ).strip()
 
 
+def _cards_envelope_schema(item_schema: Dict[str, Any], min_items: int = 1, max_items: int | None = None) -> Dict[str, Any]:
+    arr_schema: Dict[str, Any] = {
+        "type": "array",
+        "items": item_schema,
+        "minItems": min_items,
+    }
+    if max_items is not None:
+        arr_schema["maxItems"] = max_items
+    return {
+        "type": "object",
+        "properties": {
+            "cards": arr_schema
+        },
+        "required": ["cards"],
+        "additionalProperties": False,
+    }
+
+
 def _generate_batch(
     intake: Dict[str, Any], plan_text: str, batch_num: int, model: str, seen: List[Tuple[str, str]]
 ) -> List[Dict[str, Any]]:
@@ -199,7 +243,8 @@ def _generate_batch(
 BATCH PLANNING (approved by user):
 {plan_text}
 
-Now produce BATCH {batch_num} as a JSON array ONLY, following the plan and taxonomy.
+Now produce BATCH {batch_num} as JSON ONLY, following the plan and taxonomy.
+Return JSON in the wrapped form {{ "cards": [ ... ] }} — do not include any extra prose.
 
 {rules}
 
@@ -209,7 +254,7 @@ Use this seen set of (url, exact quote) already used in prior batches; do not re
 {schema}
 """
 
-    # Structured output schema for a single card item
+    # Single card schema
     card_schema = {
         "type": "object",
         "properties": {
@@ -250,32 +295,39 @@ Use this seen set of (url, exact quote) already used in prior batches; do not re
         "additionalProperties": False,
     }
 
-    # --- CHANGED: use Chat Completions with response_format (Structured Outputs) ---
+    # Wrapped object schema: {"cards":[ ... ]}
+    wrapped_schema = _cards_envelope_schema(card_schema, min_items=1)
+
+    # Chat Completions with Structured Outputs
     resp = client.chat.completions.create(
         model=model,
         messages=[
             {"role": "system", "content": "You cut debate evidence cards with meticulous sourcing and formatting."},
             {"role": "user", "content": user},
         ],
+
         response_format={
             "type": "json_schema",
             "json_schema": {
-                "name": "cards_array",
-                "schema": {
-                    "type": "array",
-                    "items": card_schema,
-                    "minItems": 1,
-                },
+                "name": "cards_object_envelope",
+                "schema": wrapped_schema,
                 "strict": True,
             },
         },
     )
-    raw = _get_output_text(resp).strip()
-    cleaned = _clean_json_array_output(raw)
-    data = json.loads(cleaned)
-    if not isinstance(data, list):
-        raise ValueError("Model did not return a JSON array.")
-    return data
+
+    obj = _get_parsed_json(resp)
+    if obj is None:
+        # Final fallback to text parsing
+        raw = _get_output_text(resp).strip()
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            raise ValueError("Model did not return valid JSON.")
+    cards = _ensure_cards_list(obj)
+    if not isinstance(cards, list) or not cards:
+        raise ValueError("Model returned empty or invalid 'cards' array.")
+    return cards
 
 
 def _merge_to_excel(all_cards: List[Dict[str, Any]]) -> BytesIO | None:
@@ -480,13 +532,13 @@ if st.session_state.get("evm_plan_approved"):
 We are correcting one card in the most recent batch. Replace the card with index {int(fix_idx)} in that batch with a new, valid card that obeys all rules. Do not duplicate any (url, exact quote) from this seen set across prior batches:
 {"\n".join([f"- URL: {u} | QUOTE: {q[:140]}" for (u,q) in seen_list]) or '(none)'}
 
-Return a JSON array with exactly ONE card following the schema below. Do not include any prose.
+Return JSON with exactly ONE card in the wrapped form {{ "cards": [ ... ] }}. Do not include any prose.
 
 {rules}
 {schema}
 """
 
-                # Single-card structured output schema
+                # Single-card schema (same as above)
                 card_schema = {
                     "type": "object",
                     "properties": {
@@ -527,28 +579,39 @@ Return a JSON array with exactly ONE card following the schema below. Do not inc
                     "additionalProperties": False,
                 }
 
-                # --- CHANGED: use Chat Completions with response_format (Structured Outputs) ---
+                wrapped_schema = _cards_envelope_schema(card_schema, min_items=1, max_items=1)
+
+                # Chat Completions with Structured Outputs
                 resp = client.chat.completions.create(
                     model=st.session_state.evm_model,
                     messages=[
                         {"role": "system", "content": "You cut debate evidence cards with meticulous sourcing and formatting."},
                         {"role": "user", "content": user},
                     ],
+            
                     response_format={
                         "type": "json_schema",
                         "json_schema": {
-                            "name": "one_card_array",
-                            "schema": {"type": "array", "items": card_schema, "minItems": 1, "maxItems": 1},
+                            "name": "one_card_object_envelope",
+                            "schema": wrapped_schema,
                             "strict": True,
                         },
                     },
                 )
-                raw = _get_output_text(resp).strip()
-                cleaned = _clean_json_array_output(raw)
-                repl = json.loads(cleaned)
-                if not isinstance(repl, list) or not repl:
-                    raise ValueError("Model did not return a one-card JSON array.")
-                replacement = repl[0]
+
+                obj = _get_parsed_json(resp)
+                if obj is None:
+                    raw = _get_output_text(resp).strip()
+                    try:
+                        obj = json.loads(raw)
+                    except Exception:
+                        raise ValueError("Model did not return valid JSON.")
+
+                repl_cards = _ensure_cards_list(obj)
+                if not isinstance(repl_cards, list) or len(repl_cards) != 1:
+                    raise ValueError("Model did not return exactly one card in 'cards'.")
+
+                replacement = repl_cards[0]
 
                 # Update seen set (remove old key, add new)
                 old_key = _seen_key(last_batch[int(fix_idx) - 1])
